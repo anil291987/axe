@@ -3,9 +3,11 @@ package preview
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 
 	"github.com/k-kohey/axe/internal/preview/analysis"
 	"github.com/k-kohey/axe/internal/preview/build"
@@ -101,19 +103,65 @@ func (sm *StreamManager) simruntimeStreamLauncher(ctx context.Context, s *stream
 		}
 	}
 
+	// Boot the simulator session and prepare the app build in parallel.
+	// Neither depends on the other, and each can take tens of seconds
+	// (headless boot + idb startup vs. xcodebuild), so running them
+	// sequentially roughly doubles the time to first frame.
 	sendStatus("booting")
-	info, err := sm.runtime.CreateSession(ctx, simruntime.CreateSessionRequest{
-		DeviceType: s.deviceType,
-		Runtime:    s.runtime,
-	})
-	if err != nil {
-		s.sendStopped(sm.ew, "resource_error", fmt.Sprintf("creating simruntime session: %v", err), "")
+	launchCtx, launchCancel := context.WithCancel(ctx)
+	defer launchCancel()
+
+	var (
+		info       *simruntime.SessionInfo
+		sessionErr error
+		prepared   *build.Result
+		prepareErr error
+		wg         sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		info, sessionErr = sm.runtime.CreateSession(launchCtx, simruntime.CreateSessionRequest{
+			DeviceType: s.deviceType,
+			Runtime:    s.runtime,
+		})
+		if sessionErr != nil {
+			launchCancel()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		prepared, prepareErr = sm.preparer.Prepare(launchCtx)
+		if prepareErr != nil {
+			launchCancel()
+			return
+		}
+		if prepared.Built {
+			sendStatus("building")
+		} else {
+			sendStatus("reusing_build")
+		}
+	}()
+	wg.Wait()
+
+	// Record the session (if any) first so cleanupStreamResources stops it
+	// even when the build side failed.
+	if info != nil {
+		s.runtimeSessionID = info.ID
+		s.deviceUDID = info.DeviceUDID
+		s.appRunner = newSimRuntimeAppRunner(sm.runtime, info.ID)
+		s.hid = newSimRuntimeInputHandler(sm.runtime, info.ID)
+	}
+	// Report the root-cause failure, not the cancellation it triggered on the other side.
+	switch {
+	case sessionErr != nil && (prepareErr == nil || !errors.Is(sessionErr, context.Canceled)):
+		s.sendStopped(sm.ew, "resource_error", fmt.Sprintf("creating simruntime session: %v", sessionErr), "")
+		return
+	case prepareErr != nil:
+		s.sendStopped(sm.ew, "build_error", "Build failed", prepareErr.Error())
 		return
 	}
-	s.runtimeSessionID = info.ID
-	s.deviceUDID = info.DeviceUDID
-	s.appRunner = newSimRuntimeAppRunner(sm.runtime, info.ID)
-	s.hid = newSimRuntimeInputHandler(sm.runtime, info.ID)
+	bs := prepared.Settings.Clone()
 
 	dirs, err := newPreviewDirs(sm.pc.PrimaryPath(), info.DeviceUDID)
 	if err != nil {
@@ -121,18 +169,6 @@ func (sm *StreamManager) simruntimeStreamLauncher(ctx context.Context, s *stream
 		return
 	}
 	s.dirs = dirs
-
-	prepared, err := sm.preparer.Prepare(ctx)
-	if err != nil {
-		s.sendStopped(sm.ew, "build_error", "Build failed", err.Error())
-		return
-	}
-	bs := prepared.Settings.Clone()
-	if prepared.Built {
-		sendStatus("building")
-	} else {
-		sendStatus("reusing_build")
-	}
 
 	depGraph, trackedFiles, dylibPath, degraded, err := sm.compileInitialThunk(ctx, s, bs, prepared.Built, sendStatus)
 	if err != nil {
@@ -216,14 +252,24 @@ func (sm *StreamManager) compileInitialThunk(ctx context.Context, s *stream, bs 
 	var depGraph *analysis.DependencyGraph
 	var trackedFiles []string
 
+	// reloadIndex is true when the on-disk Index Store may be newer than the
+	// shared cache: this stream's Prepare ran the build, or the retry below
+	// rebuilt. Otherwise another stream (or a hot-reload rebuild) already
+	// loaded the cache after the latest build, and re-reading it would just
+	// spawn axe-index-reader over the whole store again.
+	reloadIndex := builtThisLaunch
 	compileAttempt := func() (string, error) {
 		sendStatus("compiling_thunk")
-		projectRoot := filepath.Dir(sm.pc.PrimaryPath())
-		cache, cacheErr := analysis.LoadIndexStore(ctx, s.dirs.IndexStorePath(), projectRoot)
-		if cacheErr != nil && ctx.Err() == nil {
-			slog.Warn("Index store cache unavailable for stream", "streamId", s.id, "err", cacheErr)
+		if reloadIndex || sm.indexCache.Fresh() == nil {
+			projectRoot := filepath.Dir(sm.pc.PrimaryPath())
+			cache, cacheErr := analysis.LoadIndexStore(ctx, s.dirs.IndexStorePath(), projectRoot)
+			if cacheErr != nil && ctx.Err() == nil {
+				slog.Warn("Index store cache unavailable for stream", "streamId", s.id, "err", cacheErr)
+			}
+			sm.indexCache.Set(cache)
+		} else {
+			slog.Debug("Reusing shared index store cache", "streamId", s.id)
 		}
-		sm.indexCache.Set(cache)
 
 		dg, _, err := analysis.ResolveTransitiveDependencies(ctx, s.file, sm.indexCache.Get())
 		if err != nil && ctx.Err() == nil {
@@ -258,12 +304,13 @@ func (sm *StreamManager) compileInitialThunk(ctx context.Context, s *stream, bs 
 					return "", fmt.Errorf("build failed: %w", buildErr)
 				}
 				build.ExtractCompilerPaths(ctx, bs, s.dirs.ProjectDirs)
+				reloadIndex = true
 				dylibPath, err = compileAttempt()
 			}
 			return dylibPath, err
 		},
 		CompileModeMainOnly: func(context.Context) (string, error) {
-			return compileMainOnlyPipeline(ctx, s.file, bs, s.dirs, "0", 0, sm.toolchain)
+			return compileMainOnlyPipeline(ctx, s.file, sm.indexCache.Fresh(), bs, s.dirs, "0", 0, sm.toolchain)
 		},
 	})
 	if err != nil {

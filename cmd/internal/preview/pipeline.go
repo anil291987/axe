@@ -177,12 +177,30 @@ func moduleNameForSource(sourceFile, fallback string, cache *analysis.IndexStore
 	return fallback
 }
 
+// loadMainOnlyIndexCache loads the Index Store used by the main-only pipeline
+// to resolve the source file's module name. It returns nil (callers fall back
+// to bs.ModuleName) when the store cannot be read.
+func loadMainOnlyIndexCache(ctx context.Context, dirs previewDirs) *analysis.IndexStoreCache {
+	cache, err := analysis.LoadIndexStore(ctx, dirs.IndexStorePath(), "")
+	if err != nil {
+		slog.Debug("Failed to load index store for main-only module resolution", "err", err)
+		return nil
+	}
+	return cache
+}
+
 // compileMainOnlyPipeline runs the lightweight "main-only" thunk pipeline.
 // It extracts imports from the source file, generates a single main thunk
 // (no per-file dynamic replacements), and compiles it into a dylib.
+//
+// cache is used only to resolve the source file's module name. Loading it
+// spawns axe-index-reader over the whole Index Store, so callers that compile
+// repeatedly (e.g. report-mode captures) should load it once and pass it in.
+// A nil cache makes this function load it itself.
 func compileMainOnlyPipeline(
 	ctx context.Context,
 	sourceFile string,
+	cache *analysis.IndexStoreCache,
 	bs *build.Settings,
 	dirs previewDirs,
 	previewSelector string,
@@ -194,12 +212,10 @@ func compileMainOnlyPipeline(
 		return "", fmt.Errorf("source imports: %w", err)
 	}
 
-	moduleName := bs.ModuleName
-	if cache, err := analysis.LoadIndexStore(ctx, dirs.IndexStorePath(), ""); err == nil {
-		moduleName = moduleNameForSource(sourceFile, bs.ModuleName, cache)
-	} else {
-		slog.Debug("Failed to load index store for main-only module resolution", "err", err)
+	if cache == nil {
+		cache = loadMainOnlyIndexCache(ctx, dirs)
 	}
+	moduleName := moduleNameForSource(sourceFile, bs.ModuleName, cache)
 
 	thunkPaths, err := codegen.GenerateMainOnlyThunk(moduleName, dirs.Thunk, sourceFile, previewSelector, imports, reloadCounter)
 	if err != nil {

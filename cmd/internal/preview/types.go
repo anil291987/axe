@@ -88,6 +88,9 @@ func compileConfigFromSettings(s *build.Settings) codegen.CompileConfig {
 type sharedIndexCache struct {
 	mu    sync.RWMutex
 	cache *analysis.IndexStoreCache
+	// stale is set when a build ran without reloading the cache, so the
+	// in-memory data may lag the on-disk Index Store. Cleared by Set.
+	stale bool
 }
 
 func newSharedIndexCache(c *analysis.IndexStoreCache) *sharedIndexCache {
@@ -104,6 +107,27 @@ func (s *sharedIndexCache) Set(c *analysis.IndexStoreCache) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cache = c
+	s.stale = false
+}
+
+// MarkStale records that a build updated the on-disk Index Store without the
+// cache being reloaded. The current cache stays readable; the next consumer
+// that can afford a reload (e.g. a new stream) refreshes it.
+func (s *sharedIndexCache) MarkStale() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stale = true
+}
+
+// Fresh returns the cache when it is loaded and not stale, or nil when it
+// must be (re)loaded from disk.
+func (s *sharedIndexCache) Fresh() *analysis.IndexStoreCache {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.stale {
+		return nil
+	}
+	return s.cache
 }
 
 // defaultStaleThreshold is the maximum number of consecutive incremental reloads

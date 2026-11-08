@@ -210,6 +210,9 @@ func switchFile(ctx context.Context, newSourceFile string, pc ProjectConfig, bs 
 		if buildErr := build.Run(ctx, pc, dirs.ProjectDirs, wctx.build); buildErr != nil {
 			return fmt.Errorf("rebuild: %w", buildErr)
 		}
+		if ws.indexCache != nil {
+			ws.indexCache.MarkStale()
+		}
 		dylibPath, err = compileFullThunkFiles(ctx, newSourceFile, files, cache, bs, dirs, "0", counter, wctx.toolchain)
 		if err != nil {
 			// 5. Full restart as last resort.

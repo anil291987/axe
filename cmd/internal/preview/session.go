@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/k-kohey/axe/internal/preview/analysis"
 	"github.com/k-kohey/axe/internal/preview/build"
 	"github.com/k-kohey/axe/internal/preview/codegen"
 	"github.com/k-kohey/axe/internal/preview/runner"
@@ -59,6 +60,12 @@ type PreviewSession struct {
 	// Hot-reload state (mutable, not goroutine-safe).
 	reloadCounter int  // incremented after each successful reload/launch
 	appLaunched   bool // true after first successful cold start
+
+	// Index Store cache for main-only module resolution, loaded lazily on the
+	// first capture and reused afterwards. No build runs during a session, so
+	// the on-disk store cannot change between captures.
+	indexCache       *analysis.IndexStoreCache
+	indexCacheLoaded bool
 }
 
 // NewPreviewSession creates a PreviewSession by running Build and Boot in parallel,
@@ -178,7 +185,11 @@ func NewPreviewSession(ctx context.Context, cfg SessionConfig) (*PreviewSession,
 // SendReloadCommand, falling back to cold start on failure.
 func (s *PreviewSession) CapturePreview(ctx context.Context, req CaptureRequest) error {
 	counter := s.reloadCounter
-	dylibPath, err := compileMainOnlyPipeline(ctx, req.SourceFile, s.bs, s.dirs, req.PreviewSelector, counter, s.cfg.Toolchain)
+	if !s.indexCacheLoaded {
+		s.indexCache = loadMainOnlyIndexCache(ctx, s.dirs)
+		s.indexCacheLoaded = ctx.Err() == nil // retry next capture if cancelled mid-load
+	}
+	dylibPath, err := compileMainOnlyPipeline(ctx, req.SourceFile, s.indexCache, s.bs, s.dirs, req.PreviewSelector, counter, s.cfg.Toolchain)
 	if err != nil {
 		return fmt.Errorf("compile thunk: %w", err)
 	}
