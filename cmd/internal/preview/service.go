@@ -2,6 +2,7 @@ package preview
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -117,7 +119,7 @@ func Run(opts RunOptions) error {
 		}
 	}
 
-	step := &stepper{total: 6}
+	step := &stepper{total: 5}
 
 	simctl := &platform.RealSimctlRunner{}
 	var device, deviceSetPath string
@@ -137,27 +139,115 @@ func Run(opts RunOptions) error {
 		}
 	}
 
-	var dirs previewDirs
-	dirs, err = newPreviewDirs(opts.PC.PrimaryPath(), device)
+	runtime, err := simruntime.New(
+		simruntime.WithDeviceSetPath(deviceSetPath),
+		simruntime.WithSkipOrphanCleanup(deviceSetPath == ""),
+	)
 	if err != nil {
+		sendStopped("resource_error", fmt.Sprintf("creating simulator runtime: %v", err), "")
+		return fmt.Errorf("creating simulator runtime: %w", err)
+	}
+
+	projDirs, err := build.NewProjectDirs(opts.PC.PrimaryPath())
+	if err != nil {
+		runtime.Shutdown(context.Background())
 		sendStopped("resource_error", err.Error(), "")
 		return err
 	}
 
-	sendStatus("building")
-	done = step.begin("Building...")
-	var result *build.Result
-	if opts.Preparer != nil {
-		result, err = opts.Preparer.Prepare(ctx)
-	} else {
-		result, err = build.Prepare(ctx, opts.PC, dirs.ProjectDirs, opts.ReuseBuild, br)
-	}
+	// Boot the simulator session and prepare the app build in parallel.
+	sendStatus("booting")
+	done = step.begin("Building app & starting simulator session...")
+	launchCtx, launchCancel := context.WithCancel(ctx)
+	defer launchCancel()
+
+	var (
+		sessionInfo *simruntime.SessionInfo
+		sessionErr  error
+		result      *build.Result
+		buildErr    error
+		wg          sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sessionInfo, sessionErr = runtime.CreateSession(launchCtx, simruntime.CreateSessionRequest{
+			DeviceUDID: device,
+			NoHeadless: opts.NoHeadless || isExternalDevice,
+		})
+		if sessionErr != nil {
+			launchCancel()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if opts.Preparer != nil {
+			result, buildErr = opts.Preparer.Prepare(launchCtx)
+		} else {
+			result, buildErr = build.Prepare(launchCtx, opts.PC, projDirs, opts.ReuseBuild, br)
+		}
+		if buildErr != nil {
+			launchCancel()
+			return
+		}
+		if result.Built {
+			sendStatus("building")
+		} else {
+			sendStatus("reusing_build")
+		}
+	}()
+	wg.Wait()
 	done()
+
+	if sessionInfo != nil {
+		device = sessionInfo.DeviceUDID
+	}
+
+	// Handle errors, prioritizing root cause over cancellation.
+	switch {
+	case sessionErr != nil && (buildErr == nil || !errors.Is(sessionErr, context.Canceled)):
+		runtime.Shutdown(context.Background())
+		sendStopped("boot_error", fmt.Sprintf("creating simulator session: %v", sessionErr), "")
+		return fmt.Errorf("creating simulator session: %w", sessionErr)
+	case buildErr != nil:
+		if sessionInfo != nil {
+			_ = runtime.StopSession(context.Background(), sessionInfo.ID)
+		}
+		runtime.Shutdown(context.Background())
+		sendStopped("build_error", buildErr.Error(), "")
+		return buildErr
+	}
+
+	var dirs previewDirs
+	dirs, err = newPreviewDirs(opts.PC.PrimaryPath(), device)
 	if err != nil {
-		sendStopped("build_error", err.Error(), "")
+		_ = runtime.StopSession(context.Background(), sessionInfo.ID)
+		runtime.Shutdown(context.Background())
+		sendStopped("resource_error", err.Error(), "")
 		return err
 	}
 	bs := result.Settings
+
+	runtimeApp := newSimRuntimeAppRunner(runtime, sessionInfo.ID)
+	runtimeHID := newSimRuntimeInputHandler(runtime, sessionInfo.ID)
+
+	// Shared cleanup: runs on normal return, error return, and signal-triggered return.
+	var cancelStream func()
+	defer func() {
+		if cancelStream != nil {
+			cancelStream()
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		terminateApp(cleanupCtx, bs, device, deviceSetPath, ar)
+		if err := os.Remove(dirs.Socket); err != nil && !os.IsNotExist(err) {
+			slog.Debug("Failed to remove socket", "path", dirs.Socket, "err", err)
+		}
+		if err := runtime.StopSession(cleanupCtx, sessionInfo.ID); err != nil {
+			slog.Debug("Failed to stop simulator runtime session", "sessionId", sessionInfo.ID, "err", err)
+		}
+		runtime.Shutdown(cleanupCtx)
+	}()
 
 	// Use CompileStrategy to decide between full and main-only thunk compilation.
 	var depGraph *analysis.DependencyGraph
@@ -200,6 +290,7 @@ func Run(opts RunOptions) error {
 		},
 	}
 
+	sendStatus("compiling_thunk")
 	done = step.begin("Compiling thunk...")
 	compileResult, err := ExecuteCompileStrategy(ctx, strategy, compilers)
 	done()
@@ -208,50 +299,6 @@ func Run(opts RunOptions) error {
 		return err
 	}
 	dylibPath := compileResult.DylibPath
-
-	// Create a runtime session.
-	sendStatus("booting")
-	done = step.begin("Creating simulator session...")
-	runtime, err := simruntime.New(
-		simruntime.WithDeviceSetPath(deviceSetPath),
-		simruntime.WithSkipOrphanCleanup(deviceSetPath == ""),
-	)
-	if err != nil {
-		done()
-		sendStopped("resource_error", fmt.Sprintf("creating simulator runtime: %v", err), "")
-		return fmt.Errorf("creating simulator runtime: %w", err)
-	}
-	sessionInfo, err := runtime.CreateSession(ctx, simruntime.CreateSessionRequest{
-		DeviceUDID: device,
-		NoHeadless: opts.NoHeadless || isExternalDevice,
-	})
-	done()
-	if err != nil {
-		runtime.Shutdown(context.Background())
-		sendStopped("boot_error", fmt.Sprintf("creating simulator session: %v", err), "")
-		return fmt.Errorf("creating simulator session: %w", err)
-	}
-	device = sessionInfo.DeviceUDID
-	runtimeApp := newSimRuntimeAppRunner(runtime, sessionInfo.ID)
-	runtimeHID := newSimRuntimeInputHandler(runtime, sessionInfo.ID)
-
-	// Shared cleanup: runs on normal return, error return, and signal-triggered return.
-	var cancelStream func()
-	defer func() {
-		if cancelStream != nil {
-			cancelStream()
-		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		terminateApp(cleanupCtx, bs, device, deviceSetPath, ar)
-		if err := os.Remove(dirs.Socket); err != nil && !os.IsNotExist(err) {
-			slog.Debug("Failed to remove socket", "path", dirs.Socket, "err", err)
-		}
-		if err := runtime.StopSession(cleanupCtx, sessionInfo.ID); err != nil {
-			slog.Debug("Failed to stop simulator runtime session", "sessionId", sessionInfo.ID, "err", err)
-		}
-		runtime.Shutdown(cleanupCtx)
-	}()
 
 	terminateApp(ctx, bs, device, deviceSetPath, runtimeApp)
 
